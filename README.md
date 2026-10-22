@@ -21,8 +21,8 @@ if it's missing, but parsing is more precise with it).
 
 ```bash
 python3 isitphp.py example.com
-python3 isitphp.py https://ticinocoaching.ch --depth 3 --max-pages 200
-python3 isitphp.py x.domain.com --json report.json
+python3 isitphp.py https://ticinocoaching.ch --full
+python3 isitphp.py x.domain.com --full --json report.json
 ```
 
 Make it executable if you like:
@@ -32,19 +32,41 @@ chmod +x isitphp.py
 ./isitphp.py example.com
 ```
 
+### Full-site scan
+
+By default the crawl stops at `--depth 2` / `--max-pages 100`. Pass **`--full`**
+for an exhaustive scan: the depth and page caps are lifted and the crawler keeps
+going until **every in-scope address has been visited** — no new links left to
+follow — before it closes. The report then lists **every address discovered**
+and **every PHP page found**.
+
+```bash
+python3 isitphp.py ticinocoaching.ch --full
+python3 isitphp.py ticinocoaching.ch --full --json ticino.json
+```
+
+Notes for `--full`:
+- It can take a while and make many requests on a large site. Add `--delay 0.3`
+  to be gentle on a client's server.
+- Press `Ctrl-C` any time — it stops and reports what it found so far.
+- A site with a crawler trap (infinite calendars, faceted filters) can expand
+  the address list a lot; cap it instead with `--max-pages N` if needed.
+
 ### Options
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--depth N` | 2 | How many link hops to follow from the start page |
-| `--max-pages N` | 100 | Hard cap on pages crawled |
+| `--full` | off | Exhaustive crawl: no depth/page cap; visit every in-scope address, then list them all |
+| `--depth N` | 2 | How many link hops to follow from the start page (ignored with `--full`) |
+| `--max-pages N` | 100 | Hard cap on pages crawled (ignored with `--full`) |
+| `--list-addresses` | off | Print every discovered address (implied by `--full`) |
 | `--workers N` | 6 | Concurrent requests |
 | `--delay S` | 0 | Politeness pause before each request (per worker) |
 | `--timeout S` | 10 | Per-request timeout |
 | `--no-subdomains` | off | Stay on the exact host family; don't follow subdomains |
 | `--no-probe` | off | Don't probe known PHP entry points (`index.php`, `wp-login.php`, …) |
 | `--insecure` | off | Skip TLS certificate verification |
-| `--json FILE` | — | Write the full machine-readable report |
+| `--json FILE` | — | Write the full machine-readable report (includes `addresses` + `php_pages`) |
 | `-v`, `--verbose` | off | Print each page as it's crawled |
 | `--no-color` | off | Plain output |
 

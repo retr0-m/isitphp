@@ -13,8 +13,11 @@ to assess (your own clients).
 
 Usage:
     python3 isitphp.py example.com
-    python3 isitphp.py https://ticinocoaching.ch --depth 3 --max-pages 200
-    python3 isitphp.py x.domain.com --json report.json
+    python3 isitphp.py https://ticinocoaching.ch --full
+    python3 isitphp.py x.domain.com --full --json report.json
+
+Use --full for an exhaustive crawl: no depth/page cap, keep going until every
+in-scope address has been visited, then list every address and PHP page found.
 
 Dependencies:
     requests          (required)
@@ -384,6 +387,8 @@ class Crawler:
 
         self.visited = set()
         self.evidence = {}          # key() -> Evidence (deduped)
+        self.addresses = set()      # every in-scope URL discovered
+        self.php_pages = set()      # in-scope URLs ending in a PHP extension
         self.pages_ok = 0
         self.pages_err = 0
         self.probed_hosts = set()
@@ -401,6 +406,17 @@ class Crawler:
         with self.lock:
             for ev in ev_list:
                 self.evidence.setdefault(ev.key(), ev)
+
+    def record_url(self, url):
+        """Remember an in-scope URL, flagging it if it is a .php page."""
+        if not in_scope(url, self.base, self.args.include_subdomains):
+            return
+        last = urlparse(url).path.lower().rstrip("/").rsplit("/", 1)[-1]
+        is_php = any(last.endswith(ext) for ext in PHP_EXTENSIONS)
+        with self.lock:
+            self.addresses.add(url)
+            if is_php:
+                self.php_pages.add(url)
 
     def log(self, msg):
         if self.args.verbose:
@@ -439,6 +455,7 @@ class Crawler:
             # PHP headers/cookies, is what confirms the stack.
             if resp.status_code < 400 or resp.status_code in (401, 403):
                 self.log("probe {} -> {}".format(url, resp.status_code))
+                self.record_url(resp.url)
                 self.add_evidence(detect_from_url(resp.url))
                 self.add_evidence(detect_from_headers(
                     resp.headers, resp.cookies, resp.url))
@@ -462,6 +479,7 @@ class Crawler:
         final = resp.url
 
         # URL + header evidence always apply.
+        self.record_url(final)
         self.add_evidence(detect_from_url(final))
         self.add_evidence(detect_from_headers(
             resp.headers, resp.cookies, final))
@@ -473,6 +491,7 @@ class Crawler:
             self.add_evidence(detect_from_html(html, final))
             for link in extract_links(html, final):
                 # Capture URL-level signals even for links we won't crawl.
+                self.record_url(link)
                 self.add_evidence(detect_from_url(link))
                 if in_scope(link, self.base, self.args.include_subdomains):
                     new_links.append(link)
@@ -490,8 +509,13 @@ class Crawler:
         p = urlparse(self.start_url)
         self.probe_host("{}://{}".format(p.scheme, p.netloc))
 
+        # A max_pages / depth of None means "no limit" — crawl the whole site
+        # until the frontier is empty (the --full exhaustive mode).
+        max_pages = self.args.max_pages
+        max_depth = self.args.depth
+
         with ThreadPoolExecutor(max_workers=self.args.workers) as pool:
-            while queue and len(self.visited) <= self.args.max_pages:
+            while queue and (max_pages is None or len(self.visited) <= max_pages):
                 batch = []
                 while queue and len(batch) < self.args.workers:
                     batch.append(queue.popleft())
@@ -505,13 +529,14 @@ class Crawler:
                     except Exception as exc:          # noqa: BLE001
                         self.log(C.paint("worker error: {}".format(exc), C.RED))
                         continue
-                    if d >= self.args.depth:
+                    if max_depth is not None and d >= max_depth:
                         continue
                     for link in new_links:
                         with self.lock:
                             if link in self.visited:
                                 continue
-                            if len(self.visited) > self.args.max_pages:
+                            if max_pages is not None and \
+                                    len(self.visited) > max_pages:
                                 break
                             self.visited.add(link)
                         queue.append((link, d + 1))
@@ -538,8 +563,11 @@ def verdict(evidence):
 
 
 def print_report(crawler, target, elapsed):
+    args = crawler.args
     evidence = list(crawler.evidence.values())
     label, color = verdict(evidence)
+    addrs = sorted(crawler.addresses)
+    php = sorted(crawler.php_pages)
 
     print()
     print(C.paint("─" * 60, C.GREY))
@@ -547,6 +575,8 @@ def print_report(crawler, target, elapsed):
     print(C.paint("─" * 60, C.GREY))
     print("  target        : {}".format(target))
     print("  pages crawled : {}".format(crawler.pages_ok))
+    print("  addresses     : {}".format(len(addrs)))
+    print("  php pages      : {}".format(len(php)))
     print("  failed        : {}".format(crawler.pages_err))
     print("  hosts probed  : {}".format(len(crawler.probed_hosts)))
     print("  time          : {:.1f}s".format(elapsed))
@@ -557,25 +587,50 @@ def print_report(crawler, target, elapsed):
                      C.GREY))
         print(C.paint("  (That is not proof of absence — the site may hide it "
                      "behind a proxy/CDN or pretty URLs.)", C.DIM))
-        return
+    else:
+        # Group findings by confidence tier.
+        by_tier = {t: [] for t in TIER_ORDER}
+        for ev in evidence:
+            by_tier[ev.tier].append(ev)
 
-    # Group findings by confidence tier.
-    by_tier = {t: [] for t in TIER_ORDER}
-    for ev in evidence:
-        by_tier[ev.tier].append(ev)
+        for tier in TIER_ORDER:
+            items = by_tier[tier]
+            if not items:
+                continue
+            head = "  {} evidence ({})".format(tier.upper(), len(items))
+            print(C.paint(head, TIER_COLOR[tier], C.BOLD))
+            for ev in sorted(items, key=lambda e: e.signal):
+                print("    {} {}".format(
+                    C.paint("•", TIER_COLOR[tier]),
+                    ev.detail))
+                print(C.paint("        seen on: {}".format(ev.where), C.GREY))
+            print()
 
-    for tier in TIER_ORDER:
-        items = by_tier[tier]
-        if not items:
-            continue
-        head = "  {} evidence ({})".format(tier.upper(), len(items))
-        print(C.paint(head, TIER_COLOR[tier], C.BOLD))
-        for ev in sorted(items, key=lambda e: e.signal):
-            print("    {} {}".format(
-                C.paint("•", TIER_COLOR[tier]),
-                ev.detail))
-            print(C.paint("        seen on: {}".format(ev.where), C.GREY))
-        print()
+    # Every PHP page found — the core deliverable, always listed in full.
+    print(C.paint("  PHP pages found ({})".format(len(php)),
+                 C.GREEN if php else C.GREY, C.BOLD))
+    if php:
+        for u in php:
+            print("    {} {}".format(C.paint("•", C.GREEN), u))
+    else:
+        print(C.paint("    (no URLs ending in a PHP extension were seen)",
+                     C.DIM))
+    print()
+
+    # Every address discovered. Printed in full for --full / --list-addresses;
+    # otherwise summarised to avoid flooding the terminal.
+    print(C.paint("  Addresses discovered ({})".format(len(addrs)),
+                 C.CYAN, C.BOLD))
+    if args.full or args.list_addresses:
+        for u in addrs:
+            print(C.paint("    - {}".format(u), C.GREY))
+    elif addrs:
+        for u in addrs[:15]:
+            print(C.paint("    - {}".format(u), C.GREY))
+        if len(addrs) > 15:
+            print(C.paint("    … and {} more (use --list-addresses or --json "
+                         "to see all)".format(len(addrs) - 15), C.DIM))
+    print()
 
 
 def build_json(crawler, target, label, elapsed):
@@ -586,6 +641,10 @@ def build_json(crawler, target, label, elapsed):
         "pages_failed": crawler.pages_err,
         "hosts_probed": sorted(crawler.probed_hosts),
         "elapsed_seconds": round(elapsed, 2),
+        "address_count": len(crawler.addresses),
+        "php_page_count": len(crawler.php_pages),
+        "php_pages": sorted(crawler.php_pages),
+        "addresses": sorted(crawler.addresses),
         "evidence": [
             {"tier": ev.tier, "signal": ev.signal,
              "detail": ev.detail, "url": ev.where}
@@ -635,14 +694,23 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  isitphp example.com\n"
-               "  isitphp https://ticinocoaching.ch --depth 3 --max-pages 200\n"
-               "  isitphp x.domain.com --json out.json\n",
+               "  isitphp https://ticinocoaching.ch --full\n"
+               "  isitphp x.domain.com --full --json out.json\n",
     )
     parser.add_argument("target", help="website URL or domain to scan")
+    parser.add_argument("--full", action="store_true",
+                        help="exhaustive crawl: no depth or page limit — keep "
+                             "going until every in-scope address has been "
+                             "visited, then report every address and PHP page")
     parser.add_argument("--depth", type=int, default=2,
-                        help="max link depth to follow (default: 2)")
+                        help="max link depth to follow (default: 2; ignored "
+                             "with --full)")
     parser.add_argument("--max-pages", type=int, default=100,
-                        help="max pages to crawl (default: 100)")
+                        help="max pages to crawl (default: 100; ignored with "
+                             "--full)")
+    parser.add_argument("--list-addresses", action="store_true",
+                        help="print every discovered address (implied by "
+                             "--full)")
     parser.add_argument("--workers", type=int, default=6,
                         help="concurrent requests (default: 6)")
     parser.add_argument("--delay", type=float, default=0.0,
@@ -669,6 +737,11 @@ def main(argv=None):
                         help="disable coloured output")
     args = parser.parse_args(argv)
 
+    # --full lifts the depth and page caps: crawl until the frontier is empty.
+    if args.full:
+        args.depth = None
+        args.max_pages = None
+
     if args.no_color:
         C.enabled = False
 
@@ -688,8 +761,14 @@ def main(argv=None):
     print("  scope  : {}{}".format(
         C.paint(base, C.BOLD),
         " + subdomains" if args.include_subdomains else " (exact host family)"))
-    print("  limits : depth {} · {} pages · {} workers\n".format(
-        args.depth, args.max_pages, args.workers))
+    if args.full:
+        print("  mode   : {} — crawl the whole site until no new "
+              "addresses remain".format(C.paint("FULL / exhaustive", C.BOLD)))
+        print("  limits : {} · {} workers\n".format(
+            C.paint("no depth/page cap", C.YELLOW), args.workers))
+    else:
+        print("  limits : depth {} · {} pages · {} workers\n".format(
+            args.depth, args.max_pages, args.workers))
 
     # Confirm the site answers, and follow any entry redirect.
     probe_session = requests.Session()
